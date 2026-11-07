@@ -64,6 +64,10 @@
 #include "party.h"
 #include "ready.h"
 #include "spellbook.h"
+#include "utils.h"
+
+#include <unordered_map>
+#include <zlib.h>
 #include "ucmachine.h"
 #include "ucsched.h"
 #include "ucscriptop.h"
@@ -2518,8 +2522,43 @@ string Actor::get_name() const {
  *  Get npc name.
  */
 
+/*
+ *  NPC の名前の訳（日本語化）。<PATCH>/npc_names.txt に「英語の名前の CRC32（16進）<TAB>訳」の行を書く。
+ *  配布物に原文を入れないため、英語の名前そのものではなく CRC32 で引く。
+ *  セーブデータの名前は 16 バイトしか入らないので、データは英語のまま残し、表示するときに引く。
+ */
+
+static const std::unordered_map<uint32, std::string>& Npc_name_table() {
+	static std::unordered_map<uint32, std::string> table;
+	static bool                                         loaded = false;
+	if (!loaded && is_system_path_defined("<PATCH>")) {
+		loaded = true;
+		if (U7exists("<PATCH>/npc_names.txt")) {
+			auto in = U7open_in("<PATCH>/npc_names.txt", true);
+			std::string line;
+			while (in && std::getline(*in, line)) {
+				if (!line.empty() && line.back() == '\r') {
+					line.pop_back();
+				}
+				const auto tab = line.find('\t');
+				if (line.empty() || line[0] == '#' || tab == std::string::npos) {
+					continue;
+				}
+				table[static_cast<uint32>(std::stoul(line.substr(0, tab), nullptr, 16))] = line.substr(tab + 1);
+			}
+		}
+	}
+	return table;
+}
+
 string Actor::get_npc_name() const {
-	return name.empty() ? Game_object::get_name() : name;
+	if (name.empty()) {
+		return Game_object::get_name();
+	}
+	const auto&  table = Npc_name_table();
+	const uint32 crc   = static_cast<uint32>(::crc32(0L, reinterpret_cast<const Bytef*>(name.data()), static_cast<uInt>(name.size())));
+	const auto   it    = table.find(crc);
+	return it != table.end() ? it->second : name;
 }
 
 /*

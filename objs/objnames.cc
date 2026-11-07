@@ -211,6 +211,9 @@ string Game_object::get_name() const {
 	if (strchr(name, '/') == nullptr) {
 		if (quantity <= 1) {
 			display_name = name;
+		} else if (static_cast<unsigned char>(name[0]) >= 0x80) {
+			// 日本語の名前（訳した TEXT.FLX）は「金貨×120」の形にする
+			display_name = std::string(name) + "×" + std::to_string(quantity);
 		} else {
 			char buf[50];
 

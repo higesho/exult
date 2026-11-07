@@ -511,8 +511,9 @@ public:
 	std::string get_name() const override;
 	std::string get_npc_name() const;
 
+	// 名前が無いときは空を返す。日本語化の対応表があれば訳した名前を返す
 	std::string get_npc_name_string() const {
-		return name;
+		return name.empty() ? name : get_npc_name();
 	}
 
 	void set_npc_name(const char* n);
