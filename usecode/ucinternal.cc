@@ -1698,6 +1698,10 @@ int Usecode_internal::get_user_choice_num() {
 		const bool result = Get_click(x, y, Mouse::hand, &chr, false, conv, true);
 		if (!result) {    // ESC pressed, select 'bye' if poss.
 			choice_num = conv->locate_answer("bye");
+			if (choice_num < 0) {
+				// 日本語化した会話では bye を「さようなら」と訳している
+				choice_num = conv->locate_answer("さようなら");
+			}
 		} else if (chr) {       // key pressed
 			choice_num = -1;    // invalid key
 			if (std::isalnum(static_cast<unsigned char>(chr))) {
@@ -1771,6 +1775,343 @@ void Usecode_internal::read_usecode() {
 }
 
 /*
+ *  日本語化: 元の usecode の文字列を、訳の表で差し替える。
+ *
+ *  訳の表 <PATCH>/usecode_ja.tsv の 1 行: 関数(16進)<TAB>位置(10進)<TAB>原文のCRC32(16進)<TAB>訳
+ *  （訳の \n \t \\ はエスケープ。「{空}」は空の文字列）
+ *  配布物に原作のプログラムを入れないため、元の USECODE を読むときにその場で差し替える。
+ *  原文の CRC32 が合わない行は差し替えない（違う版のゲームでも壊れないように）。
+ *  文字列部を作り直したあと、文字列の位置を持つ命令（PUSHS など）の位置を付け直し、
+ *  64KB より後ろを指すものは 32 ビット版の命令に替え、飛び先を付け直す。
+ *  手順は tools/u7uc.py の rebuild() と同じ（出来上がりのバイト列も同じになる）。
+ */
+
+#include "ja_opcodes.h"
+
+#include <map>
+#include <unordered_map>
+#include <zlib.h>
+
+namespace {
+	struct Ja_entry {
+		uint32      crc;
+		std::string text;
+	};
+
+	using Ja_table = std::unordered_map<int, std::map<int, Ja_entry>>;
+
+	std::string Ja_unescape(const std::string& s) {
+		if (s == "{空}") {
+			return std::string();
+		}
+		std::string out;
+		out.reserve(s.size());
+		for (size_t i = 0; i < s.size(); i++) {
+			if (s[i] == '\\' && i + 1 < s.size()) {
+				const char c = s[++i];
+				out += c == 'n' ? '\n' : c == 't' ? '\t' : c == 'r' ? '\r' : c;
+			} else {
+				out += s[i];
+			}
+		}
+		return out;
+	}
+
+	const Ja_table& Ja_usecode_table() {
+		static Ja_table table;
+		static bool     loaded = false;
+		if (loaded || !is_system_path_defined("<PATCH>")) {
+			return table;
+		}
+		loaded = true;
+		if (!U7exists("<PATCH>/usecode_ja.tsv")) {
+			return table;
+		}
+		auto        in = U7open_in("<PATCH>/usecode_ja.tsv", true);
+		std::string line;
+		size_t      n = 0;
+		while (in && std::getline(*in, line)) {
+			if (!line.empty() && line.back() == '\r') {
+				line.pop_back();
+			}
+			if (line.empty() || line[0] == '#') {
+				continue;
+			}
+			const auto t1 = line.find('\t');
+			const auto t2 = t1 == std::string::npos ? t1 : line.find('\t', t1 + 1);
+			const auto t3 = t2 == std::string::npos ? t2 : line.find('\t', t2 + 1);
+			if (t3 == std::string::npos) {
+				continue;
+			}
+			const int    fid = static_cast<int>(std::stol(line.substr(0, t1), nullptr, 16));
+			const int    off = static_cast<int>(std::stol(line.substr(t1 + 1, t2 - t1 - 1)));
+			const uint32 crc = static_cast<uint32>(std::stoul(line.substr(t2 + 1, t3 - t2 - 1), nullptr, 16));
+			table[fid][off]  = Ja_entry{crc, Ja_unescape(line.substr(t3 + 1))};
+			n++;
+		}
+		std::cerr << "usecode_ja.tsv: " << n << " strings for " << table.size() << " functions" << std::endl;
+		return table;
+	}
+
+	struct Ja_arg {
+		int  kind;     // ja_opcodes.h の種類
+		long value;    // 飛び幅は符号つき、ほかは符号なし
+	};
+
+	struct Ja_ins {
+		int                 op;
+		std::vector<Ja_arg> args;
+		size_t              start, end;
+		int                 target;    // 飛び先の命令の番号（無ければ -1）
+	};
+
+	int Ja_arg_size(int kind) {
+		switch (kind) {
+		case 1:
+			return 1;
+		case 2:
+		case 4:
+		case 6:
+			return 2;
+		case 3:
+		case 5:
+		case 7:
+			return 4;
+		default:
+			return 0;
+		}
+	}
+
+	long Ja_read(const unsigned char* p, int size, bool sign) {
+		unsigned long v = 0;
+		for (int i = size - 1; i >= 0; i--) {
+			v = (v << 8) | p[i];
+		}
+		if (sign && size < 8 && (v & (1UL << (size * 8 - 1)))) {
+			return static_cast<long>(v) - (1L << (size * 8));
+		}
+		return static_cast<long>(v);
+	}
+
+	void Ja_write(std::vector<unsigned char>& out, long v, int size) {
+		for (int i = 0; i < size; i++) {
+			out.push_back(static_cast<unsigned char>((static_cast<unsigned long>(v) >> (8 * i)) & 0xff));
+		}
+	}
+
+	// 差し替えたら true。できなかったときは元のまま false。
+	bool Ja_translate_function(Usecode_function* fun) {
+		const Ja_table& table = Ja_usecode_table();
+		const auto      tit   = table.find(fun->id);
+		if (tit == table.end()) {
+			return false;
+		}
+		const auto& entries = tit->second;
+		// 本体を分ける: 文字列部の長さ、文字列部、それより後ろ（引数の数〜命令）
+		const unsigned char* body     = fun->code;
+		const size_t         body_len = fun->len;
+		const size_t         dl_size  = fun->extended ? 4 : 2;
+		if (body_len < dl_size) {
+			return false;
+		}
+		const size_t data_len = static_cast<size_t>(Ja_read(body, static_cast<int>(dl_size), false));
+		if (dl_size + data_len + 6 > body_len) {
+			return false;
+		}
+		const unsigned char* data     = body + dl_size;
+		const unsigned char* rest     = data + data_len;
+		const size_t         rest_len = body_len - dl_size - data_len;
+		const size_t         nextern  = static_cast<size_t>(Ja_read(rest + 4, 2, false));
+		const size_t         code_off = 6 + 2 * nextern;
+		if (code_off > rest_len) {
+			return false;
+		}
+		// 文字列部を作り直す
+		std::vector<unsigned char> ndata;
+		std::map<long, long>       remap;
+		int                        applied = 0, skipped = 0;
+		for (size_t off = 0; off < data_len;) {
+			const unsigned char* str = data + off;
+			size_t               len = 0;
+			while (off + len < data_len && str[len]) {
+				len++;
+			}
+			remap[static_cast<long>(off)] = static_cast<long>(ndata.size());
+			const auto eit                = entries.find(static_cast<int>(off));
+			bool       done               = false;
+			if (eit != entries.end()) {
+				const uint32 crc = static_cast<uint32>(::crc32(0L, str, static_cast<uInt>(len)));
+				if (crc == eit->second.crc) {
+					ndata.insert(ndata.end(), eit->second.text.begin(), eit->second.text.end());
+					done = true;
+					applied++;
+				} else {
+					skipped++;
+				}
+			}
+			if (!done) {
+				ndata.insert(ndata.end(), str, str + len);
+			}
+			ndata.push_back(0);
+			off += len + 1;
+		}
+		if (!applied) {
+			if (skipped) {
+				std::cerr << "usecode_ja: function " << std::hex << fun->id << std::dec << ": no string matched" << std::endl;
+			}
+			return false;
+		}
+		auto new_pos = [&](long v) {
+			auto it = remap.upper_bound(v);
+			if (it == remap.begin()) {
+				return v;
+			}
+			--it;
+			return it->second + (v - it->first);
+		};
+		// 命令を読む
+		const unsigned char* code     = rest + code_off;
+		const size_t         code_len = rest_len - code_off;
+		std::vector<Ja_ins>  ins;
+		std::map<size_t, int> index;
+		for (size_t p = 0; p < code_len;) {
+			const int op = code[p];
+			if (!ja_op_known[op]) {
+				std::cerr << "usecode_ja: function " << std::hex << fun->id << ": unknown opcode " << op << std::dec << std::endl;
+				return false;
+			}
+			Ja_ins in{op, {}, p, 0, -1};
+			size_t q = p + 1;
+			for (int k = 0; k < 6 && ja_op_args[op][k]; k++) {
+				const int kind = ja_op_args[op][k];
+				const int sz   = Ja_arg_size(kind);
+				if (q + sz > code_len) {
+					return false;
+				}
+				in.args.push_back(Ja_arg{kind, Ja_read(code + q, sz, kind == 6 || kind == 7)});
+				q += sz;
+			}
+			in.end   = q;
+			index[p] = static_cast<int>(ins.size());
+			ins.push_back(std::move(in));
+			p = q;
+		}
+		index[code_len] = static_cast<int>(ins.size());
+		// 飛び先を命令の番号で覚える
+		for (auto& in : ins) {
+			for (const auto& a : in.args) {
+				if (a.kind == 6 || a.kind == 7) {
+					const auto it = index.find(static_cast<size_t>(static_cast<long>(in.end) + a.value));
+					if (it == index.end()) {
+						std::cerr << "usecode_ja: function " << std::hex << fun->id << std::dec << ": bad jump" << std::endl;
+						return false;
+					}
+					in.target = it->second;
+				}
+			}
+		}
+		// 文字列の位置を付け直す。64KB より後ろは 32 ビット版の命令へ
+		for (auto& in : ins) {
+			for (auto& a : in.args) {
+				if (a.kind == 4 || a.kind == 5) {
+					a.value = new_pos(a.value);
+					if (a.kind == 4 && a.value > 0xFFFF) {
+						const int op32 = in.op == 0x1C ? 0x9C : in.op == 0x1D ? 0x9D : in.op == 0x4D ? 0xCD : -1;
+						if (op32 < 0) {
+							return false;
+						}
+						in.op  = op32;
+						a.kind = 5;
+					}
+				}
+			}
+		}
+		// 命令の長さが変わるので、飛び幅が落ち着くまで計算し直す
+		std::vector<size_t> addr(ins.size() + 1);
+		for (int round = 0;; round++) {
+			if (round >= 10) {
+				return false;
+			}
+			addr[0] = 0;
+			for (size_t i = 0; i < ins.size(); i++) {
+				size_t sz = 1;
+				for (const auto& a : ins[i].args) {
+					sz += Ja_arg_size(a.kind);
+				}
+				addr[i + 1] = addr[i] + sz;
+			}
+			bool changed = false;
+			for (size_t i = 0; i < ins.size(); i++) {
+				if (ins[i].target < 0) {
+					continue;
+				}
+				const long off = static_cast<long>(addr[ins[i].target]) - static_cast<long>(addr[i + 1]);
+				for (auto& a : ins[i].args) {
+					if (a.kind == 6 || a.kind == 7) {
+						a.value = off;
+						if (a.kind == 6 && (off < -0x8000 || off > 0x7FFF)) {
+							const int op32 = ins[i].op | 0x80;
+							if (!ja_op_known[op32]) {
+								return false;
+							}
+							ins[i].op = op32;
+							a.kind    = 7;
+							changed   = true;
+						}
+					}
+				}
+			}
+			if (!changed) {
+				break;
+			}
+		}
+		// 組み立てる
+		std::vector<unsigned char> nrest(rest, rest + code_off);
+		for (const auto& in : ins) {
+			nrest.push_back(static_cast<unsigned char>(in.op));
+			for (const auto& a : in.args) {
+				Ja_write(nrest, a.value, Ja_arg_size(a.kind));
+			}
+		}
+		const bool                 ext = fun->extended || ndata.size() + nrest.size() + 2 > 0xFFFF;
+		std::vector<unsigned char> nbody;
+		Ja_write(nbody, static_cast<long>(ndata.size()), ext ? 4 : 2);
+		nbody.insert(nbody.end(), ndata.begin(), ndata.end());
+		nbody.insert(nbody.end(), nrest.begin(), nrest.end());
+		delete[] fun->code;
+		fun->code = new unsigned char[nbody.size()];
+		std::copy(nbody.begin(), nbody.end(), fun->code);
+		fun->len      = static_cast<int>(nbody.size());
+		fun->extended = ext;
+		// 試験用: 差し替えた関数を usecode の形で書き出す（tools/u7uc.py build の結果と比べる）
+		static std::unique_ptr<std::ostream> dump;
+		static bool                          dump_tried = false;
+		if (!dump_tried) {
+			dump_tried       = true;
+			const char* path = std::getenv("EXULT_JA_DUMP_USECODE");
+			if (path && *path) {
+				dump = std::make_unique<std::ofstream>(path, std::ios::binary);
+			}
+		}
+		if (dump) {
+			std::vector<unsigned char> h;
+			if (ext) {
+				Ja_write(h, 0xFFFF, 2);
+				Ja_write(h, fun->id, 2);
+				Ja_write(h, fun->len, 4);
+			} else {
+				Ja_write(h, fun->id, 2);
+				Ja_write(h, fun->len, 2);
+			}
+			dump->write(reinterpret_cast<const char*>(h.data()), h.size());
+			dump->write(reinterpret_cast<const char*>(fun->code), fun->len);
+			dump->flush();
+		}
+		return true;
+	}
+}    // namespace
+
+/*
  *  Read in usecode functions.  These may override previously read
  *  functions.
  */
@@ -1789,7 +2130,10 @@ void Usecode_internal::read_usecode(
 	}
 	// Read in all the functions.
 	while (file.tellg() < size) {
-		auto*              fun     = new Usecode_function(file);
+		auto* fun = new Usecode_function(file);
+		if (!patch) {
+			Ja_translate_function(fun);    // 日本語化: 訳の表で文字列を差し替える
+		}
 		const unsigned int slotnum = fun->id / 0x100;
 		if (slotnum >= funs.size()) {
 			funs.resize(slotnum < 10 ? 10 : slotnum + 1);

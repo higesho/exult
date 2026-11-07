@@ -19,6 +19,7 @@ libusecode_la_SOURCES = \
 if BUILD_EXULT
 libusecode_la_SOURCES += \
 	intrinsics.cc	\
+	ja_opcodes.h	\
 	ucinternal.cc	\
 	ucinternal.h	\
 	ucmachine.cc	\
