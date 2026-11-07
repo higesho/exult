@@ -39,6 +39,15 @@
 #include "tqueue.h"
 #include "useval.h"
 
+#include <cstdlib>
+#include <iostream>
+
+// 試験用（日本語化の確認）: 環境変数 EXULT_JA_CMD があるとき、台詞と選択肢をログに書く
+static bool Ja_log_conversation() {
+	static const bool on = std::getenv("EXULT_JA_CMD") != nullptr;
+	return on;
+}
+
 using std::size_t;
 using std::string;
 
@@ -557,6 +566,9 @@ void Conversation::show_npc_message(const char* msg) {
 	string translated(msg);
 	translate_usecode_text(translated);
 	msg = translated.c_str();
+	if (Ja_log_conversation()) {
+		std::cerr << "say: " << msg << std::endl;
+	}
 	// Wait for any sprite effects to finish before showing text.
 	Effects_manager* eman = gwin->get_effects();
 	if (eman->has_active_sprites()) {
@@ -848,6 +860,13 @@ void Conversation::build_avatar_choices() {
  */
 
 void Conversation::show_avatar_choices() {
+	if (Ja_log_conversation()) {
+		std::cerr << "choices:";
+		for (size_t i = 0; i < answers.size(); i++) {
+			std::cerr << " [" << (i + 1) << "]" << answers[i];
+		}
+		std::cerr << std::endl;
+	}
 	choices_active = true;
 	repaint_conversation();
 }

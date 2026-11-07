@@ -83,7 +83,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
+#include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <sstream>
+#include <thread>
 
 #ifdef __GNUC__
 #	pragma GCC diagnostic push
@@ -239,6 +243,176 @@ void do_cleanup_output() {
 #else
 #	define EXULT_IMAGE_SUFFIX "pcx"
 #endif    // HAVE_PNG_H
+
+/*
+ *  試験用の自動操作（日本語化の確認用）。
+ *  環境変数 EXULT_JA_CMD に命令ファイルの場所を入れたときだけ動く。
+ *  ファイルができると読んで消し、1行ずつ操作をゲームに入れる。
+ *    key 名前       キーを押して離す（名前は SDL の名前。Escape、Return、Down など）
+ *                   Ctrl+S のように Ctrl+、Shift+、Alt+ を前に付けられる
+ *    text 文字列    文字を入力する（名前の入力など）
+ *    click x y      左クリック（座標はウインドウの中の座標）
+ *    dclick x y     左ダブルクリック
+ *    rclick x y     右クリック
+ *    move x y       マウスを動かす
+ *    wait ミリ秒    待つ
+ *    talk 番号      その番号の NPC に話しかける（ダブルクリックと同じ。番号は 10 進か 0x 付きの 16 進）
+ *    save / load    クイックセーブ / クイックロード（ゲームの状態を gamedat に書く / 読む）
+ *  ウインドウのフォーカスに関係なく届くので、ほかの作業の邪魔をしない。
+ */
+static bool          ja_autotest   = false;    // 試験用の自動操作が動いているか
+static std::atomic<Uint32> ja_talk_event{0};    // 話しかけ用の独自イベントの番号
+
+static void Ja_autotest_thread(std::string path) {
+	for (int tick = 0;; tick++) {
+		SDL_Delay(100);
+		if (tick % 10 == 0) {
+			// 背面にあってもゲームが動くように、ときどきフォーカスを得たことにする。
+			int          cnt = 0;
+			SDL_Window** ws  = SDL_GetWindows(&cnt);
+			if (ws && cnt > 0) {
+				SDL_Event f{};
+				f.type            = SDL_EVENT_WINDOW_FOCUS_GAINED;
+				f.window.windowID = SDL_GetWindowID(ws[0]);
+				SDL_PushEvent(&f);
+			}
+			SDL_free(ws);
+		}
+		std::vector<std::string> lines;
+		{
+			std::ifstream in(path);
+			if (!in) {
+				continue;
+			}
+			std::string line;
+			while (std::getline(in, line)) {
+				lines.push_back(line);
+			}
+		}
+		std::error_code ec;
+		std::filesystem::remove(path, ec);
+		std::cerr << "autotest: " << lines.size() << " lines" << std::endl;
+		int           count = 0;
+		SDL_Window**  wins  = SDL_GetWindows(&count);
+		SDL_WindowID  wid   = (wins && count > 0) ? SDL_GetWindowID(wins[0]) : 0;
+		SDL_free(wins);
+		{
+			// 背面にあってもゲームが動くように、フォーカスを得たことにする。
+			SDL_Event f{};
+			f.type           = SDL_EVENT_WINDOW_FOCUS_GAINED;
+			f.window.windowID = wid;
+			SDL_PushEvent(&f);
+		}
+		for (const auto& line : lines) {
+			std::istringstream ss(line);
+			std::string        cmd;
+			ss >> cmd;
+			if (cmd == "wait") {
+				int ms = 0;
+				ss >> ms;
+				SDL_Delay(ms);
+			} else if (cmd == "talk" || cmd == "save" || cmd == "load") {
+				// ゲームの処理は主スレッドでしか触れないので、イベントにして渡す。
+				// 番号 0 以上は話しかけ、-1 はセーブ、-2 はロード。
+				std::string num = cmd == "save" ? "-1" : cmd == "load" ? "-2" : "";
+				if (num.empty()) {
+					ss >> num;
+				}
+				if (!ja_talk_event) {
+					ja_talk_event = SDL_RegisterEvents(1);
+				}
+				SDL_Event e{};
+				e.type      = ja_talk_event;
+				e.user.code = static_cast<Sint32>(std::stol(num, nullptr, 0));
+				SDL_PushEvent(&e);
+			} else if (cmd == "text") {
+				std::string str;
+				std::getline(ss >> std::ws, str);
+				for (const char ch : str) {
+					// SDL は文字列を写さないので、使い終わっても消さない（試験用なので少しの漏れは気にしない）
+					char*     buf = SDL_strdup(std::string(1, ch).c_str());
+					SDL_Event e{};
+					e.type          = SDL_EVENT_TEXT_INPUT;
+					e.text.windowID = wid;
+					e.text.text     = buf;
+					SDL_PushEvent(&e);
+					SDL_Delay(60);
+				}
+			} else if (cmd == "key") {
+				std::string name;
+				ss >> name;
+				SDL_Keymod mod = SDL_KMOD_NONE;
+				for (;;) {
+					const auto plus = name.find('+');
+					if (plus == std::string::npos || plus + 1 >= name.size()) {
+						break;
+					}
+					const std::string m = name.substr(0, plus);
+					if (m == "Ctrl") {
+						mod |= SDL_KMOD_LCTRL;
+					} else if (m == "Shift") {
+						mod |= SDL_KMOD_LSHIFT;
+					} else if (m == "Alt") {
+						mod |= SDL_KMOD_LALT;
+					}
+					name = name.substr(plus + 1);
+				}
+				const SDL_Scancode sc = SDL_GetScancodeFromName(name.c_str());
+				if (sc == SDL_SCANCODE_UNKNOWN) {
+					std::cerr << "autotest: unknown key " << name << std::endl;
+					continue;
+				}
+				for (int down = 1; down >= 0; down--) {
+					SDL_Event e{};
+					e.type         = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+					e.key.windowID = wid;
+					e.key.scancode = sc;
+					e.key.key      = SDL_GetKeyFromScancode(sc, SDL_KMOD_NONE, false);
+					e.key.mod      = mod;
+					e.key.down     = down != 0;
+					SDL_PushEvent(&e);
+					SDL_Delay(60);
+				}
+			} else if (cmd == "click" || cmd == "dclick" || cmd == "rclick" || cmd == "move") {
+				float x = 0, y = 0;
+				ss >> x >> y;
+				SDL_Event m{};
+				m.type            = SDL_EVENT_MOUSE_MOTION;
+				m.motion.windowID = wid;
+				m.motion.x        = x;
+				m.motion.y        = y;
+				SDL_PushEvent(&m);
+				SDL_Delay(80);
+				const int     times = cmd == "dclick" ? 2 : (cmd == "move" ? 0 : 1);
+				const Uint8   btn   = cmd == "rclick" ? SDL_BUTTON_RIGHT : SDL_BUTTON_LEFT;
+				for (int i = 0; i < times; i++) {
+					for (int down = 1; down >= 0; down--) {
+						SDL_Event e{};
+						e.type            = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+						e.button.windowID = wid;
+						e.button.button   = btn;
+						e.button.down     = down != 0;
+						e.button.clicks   = static_cast<Uint8>(i + 1);
+						e.button.x        = x;
+						e.button.y        = y;
+						SDL_PushEvent(&e);
+						SDL_Delay(50);
+					}
+				}
+			}
+			SDL_Delay(100);
+		}
+	}
+}
+
+static void Ja_start_autotest() {
+	const char* path = std::getenv("EXULT_JA_CMD");
+	if (path && *path) {
+		std::cerr << "autotest: watching " << path << std::endl;
+		ja_autotest = true;
+		std::thread(Ja_autotest_thread, std::string(path)).detach();
+	}
+}
 
 int main(int argc, char* argv[]) {
 	bool needhelp    = false;
@@ -664,6 +838,7 @@ int exult_main(const char* runpath) {
 #elif defined(ANDROID)
 	touchui = new TouchUI_Android();
 #endif
+	Ja_start_autotest();    // 試験用。Init() の中でメニューまで動くので、その前に始める
 	Init();    // Create main window.
 
 	cheat.finish_init();
@@ -1705,6 +1880,26 @@ static void Handle_event(SDL_Event& event) {
 	static uint32 last_b1_click     = 0;
 	static uint32 last_b3_click     = 0;
 	static uint32 last_b1down_click = 0;
+	if (ja_autotest && ja_talk_event && event.type == ja_talk_event) {
+		// 試験用: 指定の NPC に話しかける。-1 / -2 はクイックセーブ / クイックロード
+		if (event.user.code == -1) {
+			ActionQuicksave(nullptr);
+			std::cerr << "autotest: saved" << std::endl;
+			return;
+		}
+		if (event.user.code == -2) {
+			ActionQuickrestore(nullptr);
+			std::cerr << "autotest: restored" << std::endl;
+			return;
+		}
+		Actor* npc = gwin->get_npc(event.user.code);
+		if (npc) {
+			npc->activate(1);
+		} else {
+			std::cerr << "autotest: no npc " << event.user.code << std::endl;
+		}
+		return;
+	}
 	switch (event.type) {
 	case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
 		// Ignore axis changes on anything but a specific thumb-stick
@@ -2097,7 +2292,9 @@ static void Handle_event(SDL_Event& event) {
 		gwin->get_focus();
 		break;
 	case SDL_EVENT_WINDOW_FOCUS_LOST:
-		gwin->lose_focus();
+		if (!ja_autotest) {    // 試験中は背面でも止めない
+			gwin->lose_focus();
+		}
 		break;
 	case SDL_EVENT_QUIT:
 		gwin->get_gump_man()->okay_to_quit();
@@ -2465,7 +2662,9 @@ static bool Get_click(
 				gwin->get_focus();
 				break;
 			case SDL_EVENT_WINDOW_FOCUS_LOST:
-				gwin->lose_focus();
+				if (!ja_autotest) {    // 試験中は背面でも止めない
+					gwin->lose_focus();
+				}
 				break;
 			}
 		}
