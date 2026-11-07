@@ -21,10 +21,13 @@
 
 #include "hash_utils.h"
 
+#include <cstdint>
 #include <memory>
+#include <unordered_map>
 
 class Image_buffer8;
 class Shape_file;
+class Shape_frame;
 class IDataSource;
 struct File_spec;
 class U7multiobject;
@@ -54,8 +57,18 @@ private:
 	int                         ver_lead = 0;
 	std::unique_ptr<Shape_file> font_shapes;
 	int                         highest = 0, lowest = 0;
+	// 日本語の字（UTF-8 の多バイト文字）の絵。字の番号ごとに作って取っておく。
+	std::unordered_map<uint32_t, std::shared_ptr<Shape_frame>> jglyphs;
+	int  jfill    = -1;       // 日本語の字の色（パレット番号）
+	int  joutline = -1;       // 縁取りの色。-1 なら縁取りなし
+	int  jsize    = 0;        // 使う日本語フォントの大きさ（8 か 12）。0 は未決定
+	bool jready   = false;    // 色と大きさを決めたか
 
-	void calc_highlow();
+	void         calc_highlow();
+	void         prepare_jglyphs();
+	Shape_frame* get_jglyph(uint32_t cp);
+	// text から1字読んで、その字の絵を返す。end が nullptr なら 0 終端まで。
+	Shape_frame* next_frame(const char*& text, const char* end);
 	void clean_up();
 	int  load_internal(IDataSource& data, int hlead, int vlead);
 

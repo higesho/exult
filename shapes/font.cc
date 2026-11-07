@@ -27,7 +27,15 @@
 #include "exceptions.h"
 #include "ibuf8.h"
 #include "ignore_unused_variable_warning.h"
+#include "utils.h"
 #include "vgafile.h"
+
+#include <algorithm>
+#include <array>
+#include <cstdio>
+#include <cstring>
+#include <istream>
+#include <vector>
 
 using std::size_t;
 using std::string;
@@ -35,6 +43,312 @@ using std::strncmp;
 using std::toupper;
 
 FontManager fontManager;
+
+/*
+ *  日本語（UTF-8 の多バイト文字）の対応。
+ *
+ *  正しい UTF-8 の並びは1字として読み、別に用意した日本語フォント
+ *  （<PATCH>/jfont8.bin、<PATCH>/jfont12.bin）の絵で描く。
+ *  正しくないバイト（Exult の内蔵フォントの特殊文字 0x81 など）は、
+ *  今までどおり1バイト1字として描く。
+ */
+
+namespace {
+	// UTF-8 を1字読む。読めたら字の番号を返し、len にバイト数を入れる。
+	// 正しい並びでなければ -1 を返す。
+	// end が nullptr なら 0 終端の文字列として読む。
+	long Utf8_peek(const char* text, const char* end, int& len) {
+		const auto*    s = reinterpret_cast<const unsigned char*>(text);
+		const unsigned c = s[0];
+		int            n;
+		uint32_t       cp;
+		if (c < 0xC2) {
+			return -1;
+		} else if (c < 0xE0) {
+			n  = 2;
+			cp = c & 0x1F;
+		} else if (c < 0xF0) {
+			n  = 3;
+			cp = c & 0x0F;
+		} else if (c < 0xF5) {
+			n  = 4;
+			cp = c & 0x07;
+		} else {
+			return -1;
+		}
+		if (end && text + n > end) {
+			return -1;
+		}
+		for (int i = 1; i < n; i++) {
+			// 0 終端なら s[i] が 0 のところでここに引っかかって止まる。
+			if ((s[i] & 0xC0) != 0x80) {
+				return -1;
+			}
+			cp = (cp << 6) | (s[i] & 0x3F);
+		}
+		len = n;
+		return static_cast<long>(cp);
+	}
+
+	// 1字分のバイト数（正しくない並びは1バイト）。
+	inline int Char_len(const char* text, const char* end = nullptr) {
+		int len;
+		return Utf8_peek(text, end, len) >= 0 ? len : 1;
+	}
+
+	// 日本語として1字ずつ折り返してよい字か（かな、漢字、全角の記号など）。
+	inline bool Is_cjk(long cp) {
+		return cp >= 0x2000;
+	}
+
+	inline bool Is_cjk_at(const char* text) {
+		int len;
+		return Is_cjk(Utf8_peek(text, nullptr, len));
+	}
+
+	bool In_list(const char32_t* list, long cp) {
+		for (; *list; list++) {
+			if (static_cast<long>(*list) == cp) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// 行の頭に来てはいけない字（行頭禁則）。
+	bool Is_no_start(long cp) {
+		if (cp < 0x80) {
+			return cp == '.' || cp == ',' || cp == '!' || cp == '?' || cp == '"' || cp == '\'' || cp == ')' || cp == ':'
+				   || cp == ';';
+		}
+		return In_list(
+				U"、。，．・：；？！ー」』）】〉》〕｝］〟”’ゝゞヽヾぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ…‥～", cp);
+	}
+
+	// 行の終わりに来てはいけない字（開きかっこ）。
+	bool Is_no_end(long cp) {
+		return In_list(U"「『（【〈《〔｛［〝“‘", cp);
+	}
+
+	// 文の切れ目になる日本語の記号で終わっているか（pbreak 用）。
+	bool Ends_with_jpunct(const char* start, const char* end) {
+		static const char* const marks[] = {"。", "！", "？", "」", "』", "、", "…"};
+		for (const char* m : marks) {
+			const size_t n = std::strlen(m);
+			if (static_cast<size_t>(end - start) >= n && std::memcmp(end - n, m, n) == 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// 日本語フォント（BDF から作った独自形式）。
+	//   "U7JF" 版(2) 字数(2) 幅(1) 高さ(1) 1行のバイト数(1) 予備(1)
+	//   字の番号(4)×字数（小さい順）、絵（高さ×1行のバイト数）×字数
+	struct JFont {
+		int                   w = 0, h = 0, bpr = 0;
+		std::vector<uint32_t> cps;
+		std::vector<uint8_t>  bits;
+
+		const uint8_t* find(uint32_t cp) const {
+			auto it = std::lower_bound(cps.begin(), cps.end(), cp);
+			if (it == cps.end() || *it != cp) {
+				return nullptr;
+			}
+			return bits.data() + (it - cps.begin()) * h * bpr;
+		}
+	};
+
+	const JFont* Get_jfont(int size) {
+		static std::array<std::unique_ptr<JFont>, 2> fonts;
+		static std::array<bool, 2>                   tried{};
+		const int                                    idx = size >= 12 ? 1 : 0;
+		if (tried[idx]) {
+			return fonts[idx].get();
+		}
+		if (!is_system_path_defined("<PATCH>")) {
+			return nullptr;    // まだパスが決まっていないので、あとでもう一度試す。
+		}
+		tried[idx] = true;
+		char name[64];
+		std::snprintf(name, sizeof(name), "<PATCH>/jfont%d.bin", idx ? 12 : 8);
+		if (!U7exists(name)) {
+			return nullptr;
+		}
+		try {
+			auto in = U7open_in(name, false);
+			if (!in) {
+				return nullptr;
+			}
+			unsigned char hdr[12];
+			in->read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+			if (!in->good() || std::memcmp(hdr, "U7JF", 4) != 0) {
+				std::cerr << name << ": not a Japanese font file" << std::endl;
+				return nullptr;
+			}
+			auto      f   = std::make_unique<JFont>();
+			const int cnt = hdr[6] | (hdr[7] << 8);
+			f->w          = hdr[8];
+			f->h          = hdr[9];
+			f->bpr        = hdr[10];
+			f->cps.resize(cnt);
+			for (auto& cp : f->cps) {
+				unsigned char b[4];
+				in->read(reinterpret_cast<char*>(b), 4);
+				cp = b[0] | (b[1] << 8) | (b[2] << 16) | (static_cast<uint32_t>(b[3]) << 24);
+			}
+			f->bits.resize(static_cast<size_t>(cnt) * f->h * f->bpr);
+			in->read(reinterpret_cast<char*>(f->bits.data()), static_cast<std::streamsize>(f->bits.size()));
+			if (!in->good()) {
+				std::cerr << name << ": file is too short" << std::endl;
+				return nullptr;
+			}
+			fonts[idx] = std::move(f);
+		} catch (const std::exception& e) {
+			std::cerr << name << ": " << e.what() << std::endl;
+		}
+		return fonts[idx].get();
+	}
+
+	// RLE の絵に使われている色を数える。
+	void Count_colors(Shape_frame* f, std::array<int, 256>& cnt) {
+		const unsigned char* p = f->get_data();
+		if (!p) {
+			return;
+		}
+		const unsigned char* const pend = p + f->get_size();
+		while (p + 2 <= pend) {
+			const int bl = p[0] | (p[1] << 8);
+			p += 2;
+			if (bl == 0 || p + 4 > pend) {
+				break;
+			}
+			p += 4;    // x, y
+			int n = bl >> 1;
+			if ((bl & 1) == 0) {
+				for (int i = 0; i < n && p < pend; i++) {
+					cnt[*p++]++;
+				}
+			} else {
+				while (n > 0 && p < pend) {
+					const int b = *p++;
+					const int c = b >> 1;
+					if (b & 1) {
+						cnt[*p++] += c;
+					} else {
+						for (int i = 0; i < c && p < pend; i++) {
+							cnt[*p++]++;
+						}
+					}
+					n -= c;
+				}
+			}
+		}
+	}
+}    // namespace
+
+/*
+ *  日本語の字の色と大きさを、元のフォントの絵から決める。
+ */
+
+void Font::prepare_jglyphs() {
+	jready = true;
+	if (!font_shapes) {
+		return;
+	}
+	std::array<int, 256> cnt{};
+	for (int i = 0; i < font_shapes->get_num_frames(); i++) {
+		Shape_frame* f = font_shapes->get_frame(i);
+		if (f && f->is_rle()) {
+			Count_colors(f, cnt);
+		}
+	}
+	// いちばん多い色と、その次に多い色。
+	int first = -1, second = -1;
+	for (int c = 0; c < 256; c++) {
+		if (!cnt[c]) {
+			continue;
+		}
+		if (first < 0 || cnt[c] > cnt[first]) {
+			second = first;
+			first  = c;
+		} else if (second < 0 || cnt[c] > cnt[second]) {
+			second = c;
+		}
+	}
+	jfill    = first < 0 ? 0 : first;
+	joutline = -1;
+	// 黒（0）がいちばん多く、ほかの色もそれなりにあるなら、黒は縁取り。
+	if (first == 0 && second > 0 && cnt[second] * 5 > cnt[0]) {
+		jfill    = second;
+		joutline = 0;
+	}
+	const int room = highest + lowest + 1 - (joutline >= 0 ? 2 : 0);
+	jsize          = (room >= 12 && Get_jfont(12)) ? 12 : 8;
+}
+
+Shape_frame* Font::get_jglyph(uint32_t cp) {
+	if (!jready) {
+		prepare_jglyphs();
+	}
+	auto it = jglyphs.find(cp);
+	if (it != jglyphs.end()) {
+		return it->second.get();
+	}
+	const JFont* jf = Get_jfont(jsize);
+	if (!jf && jsize == 12) {
+		jf = Get_jfont(8);
+	}
+	const uint8_t* bits = jf ? jf->find(cp) : nullptr;
+	if (!bits) {
+		jglyphs[cp] = nullptr;
+		return nullptr;
+	}
+	const int pad = joutline >= 0 ? 1 : 0;
+	const int w   = jf->w + 2 * pad;
+	const int h   = jf->h + 2 * pad;
+	std::vector<unsigned char> pix(static_cast<size_t>(w) * h, 255);
+	auto on = [&](int x, int y) {
+		return x >= 0 && y >= 0 && x < jf->w && y < jf->h && (bits[y * jf->bpr + x / 8] & (0x80 >> (x % 8)));
+	};
+	for (int y = 0; y < h; y++) {
+		for (int x = 0; x < w; x++) {
+			const int gx = x - pad;
+			const int gy = y - pad;
+			if (on(gx, gy)) {
+				pix[y * w + x] = static_cast<unsigned char>(jfill);
+			} else if (pad) {
+				for (int dy = -1; dy <= 1; dy++) {
+					for (int dx = -1; dx <= 1; dx++) {
+						if (on(gx + dx, gy + dy)) {
+							pix[y * w + x] = static_cast<unsigned char>(joutline);
+						}
+					}
+				}
+			}
+		}
+	}
+	// 行の高さの中で上下の真ん中に置く。
+	const int line  = highest + lowest + 1;
+	const int top   = std::max(0, (line - h + 1) / 2);
+	auto      frame = std::make_shared<Shape_frame>(pix.data(), w, h, 0, highest - top, true);
+	jglyphs[cp]     = frame;
+	return frame.get();
+}
+
+Shape_frame* Font::next_frame(const char*& text, const char* end) {
+	int        len;
+	const long cp = Utf8_peek(text, end, len);
+	if (cp >= 0) {
+		text += len;
+		if (Shape_frame* f = get_jglyph(static_cast<uint32_t>(cp))) {
+			return f;
+		}
+		// 日本語フォントに無い字は「?」で描く。
+		return font_shapes->get_frame('?');
+	}
+	return font_shapes->get_frame(static_cast<unsigned char>(*text++));
+}
 
 //	Want a more restrictive test for space.
 inline bool Is_space(char c) {
@@ -65,8 +379,30 @@ static const char* Pass_space(const char* text) {
  */
 
 static const char* Pass_word(const char* text) {
+	int len;
+	// 日本語は1字ずつ折り返す。ただし行頭禁則の字と、開きかっこの次の字はくっつける。
+	if (Is_cjk(Utf8_peek(text, nullptr, len))) {
+		for (;;) {
+			const long cp = Utf8_peek(text, nullptr, len);
+			text += cp >= 0 ? len : 1;
+			if (!Is_no_end(cp) || !*text) {
+				break;
+			}
+		}
+		while (*text) {
+			const long cp = Utf8_peek(text, nullptr, len);
+			if (!Is_no_start(cp >= 0 ? cp : static_cast<unsigned char>(*text))) {
+				break;
+			}
+			text += cp >= 0 ? len : 1;
+		}
+		return text;
+	}
 	while (*text && (*text != '^') && (!Is_space(*text) || (*text == '\f') || (*text == '\v'))) {
-		text++;
+		if (Is_cjk_at(text)) {
+			break;
+		}
+		text += Char_len(text);
 	}
 	return text;
 }
@@ -163,9 +499,13 @@ int Font::paint_text_box(
 				break;
 			}
 		}
-		const bool ucase_next = *text == '^';
+		bool ucase_next = *text == '^';
 		if (ucase_next) {    // Skip it.
 			text++;
+			// 日本語の字の前の ^ は無視する。
+			if (static_cast<unsigned char>(*text) >= 0x80) {
+				ucase_next = false;
+			}
 		}
 		// Pass word & get its width.
 		const char* ewrd = Pass_word(text);
@@ -200,7 +540,8 @@ int Font::paint_text_box(
 		curx += width;
 		text = ewrd;    // Continue past the word.
 		// Keep loc. of punct. endings.
-		if (text[-1] == '.' || text[-1] == '?' || text[-1] == '!' || text[-1] == ',' || text[-1] == '"') {
+		if (text[-1] == '.' || text[-1] == '?' || text[-1] == '!' || text[-1] == ',' || text[-1] == '"'
+			|| Ends_with_jpunct(start, text)) {
 			last_punct_end    = text;
 			last_punct_line   = cur_line;
 			last_punct_offset = static_cast<int>(lines[cur_line].length());
@@ -261,9 +602,9 @@ int Font::paint_text(
 	int x = xoff;
 	yoff += get_text_baseline();
 	if (font_shapes) {
-		int chr;
-		while ((chr = *text++) != 0) {
-			Shape_frame* shape = font_shapes->get_frame(static_cast<unsigned char>(chr));
+		while (*text) {
+			const int    chr   = static_cast<unsigned char>(*text);
+			Shape_frame* shape = next_frame(text, nullptr);
 			if (!shape || !shape->is_rle()) {
 				auto oldflags = std::cerr.flags();
 
@@ -300,9 +641,10 @@ int Font::paint_text(
 	int x = xoff;
 	yoff += get_text_baseline();
 	if (font_shapes) {
-		while (textlen--) {
-			int          chr;
-			Shape_frame* shape = font_shapes->get_frame(static_cast<unsigned char>(chr = *text++));
+		const char* const end = text + textlen;
+		while (text < end) {
+			const int    chr   = static_cast<unsigned char>(*text);
+			Shape_frame* shape = next_frame(text, end);
 			if (!shape || !shape->is_rle()) {
 				auto oldflags = std::cerr.flags();
 
@@ -404,8 +746,12 @@ int Font::paint_text_box_fixedwidth(
 			text++;
 		}
 		// Pass word & get its width.
-		const char* ewrd  = Pass_word(text);
-		const int   width = static_cast<int>(ewrd - text) * char_width;
+		const char* ewrd = Pass_word(text);
+		int         nch  = 0;
+		for (const char* q = text; q < ewrd; q += Char_len(q, ewrd)) {
+			nch++;
+		}
+		const int width = nch * char_width;
 		if (curx + width - hor_lead > endx) {
 			// Word-wrap.
 			if (ucase_next) {
@@ -427,7 +773,8 @@ int Font::paint_text_box_fixedwidth(
 		curx += width;
 		text = ewrd;    // Continue past the word.
 		// Keep loc. of punct. endings.
-		if (text[-1] == '.' || text[-1] == '?' || text[-1] == '!' || text[-1] == ',' || text[-1] == '"') {
+		if (text[-1] == '.' || text[-1] == '?' || text[-1] == '!' || text[-1] == ',' || text[-1] == '"'
+			|| Ends_with_jpunct(start, text)) {
 			last_punct_end    = text;
 			last_punct_line   = cur_line;
 			last_punct_offset = static_cast<int>(lines[cur_line].length());
@@ -480,8 +827,8 @@ int Font::paint_text_fixedwidth(
 	int w;
 	int chr;
 	yoff += get_text_baseline();
-	while ((chr = *text++) != 0) {
-		Shape_frame* shape = font_shapes->get_frame(static_cast<unsigned char>(chr));
+	while ((chr = static_cast<unsigned char>(*text)) != 0) {
+		Shape_frame* shape = next_frame(text, nullptr);
 		if (!shape || !shape->is_rle()) {
 			auto oldflags = std::cerr.flags();
 
@@ -520,9 +867,10 @@ int Font::paint_text_fixedwidth(
 	int w;
 	int x = xoff;
 	yoff += get_text_baseline();
-	while (textlen--) {
-		int          chr;
-		Shape_frame* shape = font_shapes->get_frame(static_cast<unsigned char>(chr = *text++));
+	const char* const end = text + textlen;
+	while (text < end) {
+		const int    chr   = static_cast<unsigned char>(*text);
+		Shape_frame* shape = next_frame(text, end);
 		if (!shape || !shape->is_rle()) {
 			auto oldflags = std::cerr.flags();
 			std::cerr << " unable to find rle frame for character '" << char(chr) << "' 0x" << std::hex << chr << " in font"
@@ -549,9 +897,8 @@ int Font::paint_text_fixedwidth(
 int Font::get_text_width(const char* text) {
 	int width = 0;
 	if (font_shapes) {
-		short chr;
-		while ((chr = *text++) != 0) {
-			Shape_frame* shape = font_shapes->get_frame(static_cast<unsigned char>(chr));
+		while (*text) {
+			Shape_frame* shape = next_frame(text, nullptr);
 			if (shape && shape->is_rle()) {
 				width += shape->get_width() + hor_lead;
 			}
@@ -570,8 +917,9 @@ int Font::get_text_width(
 ) {
 	int width = 0;
 	if (font_shapes) {
-		while (textlen--) {
-			Shape_frame* shape = font_shapes->get_frame(static_cast<unsigned char>(*text++));
+		const char* const end = text + textlen;
+		while (text < end) {
+			Shape_frame* shape = next_frame(text, end);
 			if (shape && shape->is_rle()) {
 				width += shape->get_width() + hor_lead;
 			}
@@ -587,14 +935,13 @@ void Font::get_text_box_dims(const char* text, int& width, int& height, int vert
 
 	int num_lines = 1;
 	if (font_shapes) {
-		short chr;
-		while ((chr = *text++) != 0) {
-			if (chr == '\n') {
+		while (*text) {
+			if (*text == '\n') {
 				num_lines++;
 				width     = std::max(width, cur_width);
 				cur_width = 0;
 			}
-			Shape_frame* shape = font_shapes->get_frame(static_cast<unsigned char>(chr));
+			Shape_frame* shape = next_frame(text, nullptr);
 			if (shape && shape->is_rle()) {
 				cur_width += shape->get_width() + hor_lead;
 			}
@@ -684,9 +1031,13 @@ int Font::find_cursor(
 				break;
 			}
 		}
-		const bool ucase_next = *text == '^';
+		bool ucase_next = *text == '^';
 		if (ucase_next) {    // Skip it.
 			text++;
+			// 日本語の字の前の ^ は無視する。
+			if (static_cast<unsigned char>(*text) >= 0x80) {
+				ucase_next = false;
+			}
 		}
 		// Pass word & get its width.
 		const char* ewrd = Pass_word(text);
@@ -739,12 +1090,14 @@ int Font::find_xcursor(
 ) {
 	const char* start = text;
 	int         curx  = 0;
-	while (textlen--) {
-		Shape_frame* shape = font_shapes->get_frame(static_cast<unsigned char>(*text++));
+	const char* const end = text + textlen;
+	while (text < end) {
+		const char*  here  = text;
+		Shape_frame* shape = next_frame(text, end);
 		if (shape && shape->is_rle()) {
 			const int w = shape->get_width() + hor_lead;
 			if (cx >= curx && cx < curx + w) {
-				return static_cast<int>(text - 1 - start);
+				return static_cast<int>(here - start);
 			}
 			curx += w;
 		}
@@ -812,6 +1165,8 @@ int Font::center_text(Image_buffer8* win, int x, int y, const char* s, unsigned 
 
 void Font::calc_highlow() {
 	bool unset = true;
+	jglyphs.clear();
+	jready = false;
 
 	for (int i = 0; i < font_shapes->get_num_frames(); i++) {
 		Shape_frame* f = font_shapes->get_frame(i);
@@ -833,6 +1188,21 @@ void Font::calc_highlow() {
 		if (f->get_ybelow() > lowest) {
 			lowest = f->get_ybelow();
 		}
+	}
+	// 日本語フォントがあるなら、その字が収まる高さにする。
+	if (!unset && Get_jfont(8)) {
+		prepare_jglyphs();
+		const JFont* use = Get_jfont(jsize);
+		if (!use) {
+			use = Get_jfont(8);
+		}
+		const int need = use->h + (joutline >= 0 ? 2 : 0);
+		const int line = highest + lowest + 1;
+		if (need > line) {
+			lowest += need - line;
+		}
+		jglyphs.clear();
+		jready = false;
 	}
 }
 
