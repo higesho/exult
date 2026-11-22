@@ -95,7 +95,7 @@ static std::string Ja_key_comment(const std::string& en) {
 			{"Next song", "次の曲"},
 			{"Previous song", "前の曲"},
 			{"Orb of the Moons", "月のオーブを使う"},
-			{"Show Jawbone", "あご骨を見る"},
+			{"Show Jawbone", "蛇のあご骨を見る"},
 			{"Show inventory for Avatar", "アバターの持ち物"},
 			{"Show inventory for character 2", "2人目の持ち物"},
 			{"Show inventory for character 3", "3人目の持ち物"},
