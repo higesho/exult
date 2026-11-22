@@ -340,7 +340,12 @@ bool Notebook_gump::paint_page(
 			h -= 12;
 			ampm = Strings::pm();
 		}
-		snprintf(buf, sizeof(buf), "%s %d, %02d:%02d%s", Strings::Day(), note->day, h ? h : 12, note->minute, ampm);
+		if (static_cast<unsigned char>(Strings::Day()[0]) >= 0x80) {
+			// 日本語の訳のときは「0日目 午前6:23」の順にする。
+			snprintf(buf, sizeof(buf), "%d%s目 %s%d:%02d", note->day, Strings::Day(), ampm, h ? h : 12, note->minute);
+		} else {
+			snprintf(buf, sizeof(buf), "%s %d, %02d:%02d%s", Strings::Day(), note->day, h ? h : 12, note->minute, ampm);
+		}
 #if defined(SDL_PLATFORM_IOS) || defined(ANDROID)
 		const int fontnum = 4;
 		const int yoffset = 0;

@@ -70,6 +70,59 @@ public:
 	}
 } chardata;
 
+// キー設定ファイル（defaultkeys.txt）の注釈の日本語訳。キー一覧に出る。
+static std::string Ja_key_comment(const std::string& en) {
+	static const char* const table[][2] = {
+			{"Run east", "東へ走る"},
+			{"Run west", "西へ走る"},
+			{"Run north", "北へ走る"},
+			{"Run south", "南へ走る"},
+			{"Run north-east", "北東へ走る"},
+			{"Run north-west", "北西へ走る"},
+			{"Run south-east", "南東へ走る"},
+			{"Run south west", "南西へ走る"},
+			{"Walk east", "東へ歩く"},
+			{"Walk west", "西へ歩く"},
+			{"Walk north", "北へ歩く"},
+			{"Walk south", "南へ歩く"},
+			{"Walk north-east", "北東へ歩く"},
+			{"Walk north-west", "北西へ歩く"},
+			{"Walk south-east", "南東へ歩く"},
+			{"Walk south west", "南西へ歩く"},
+			{"Create gold", "金貨を作る"},
+			{"Create last shape", "最後のシェイプを作る"},
+			{"Feed", "食事をとる"},
+			{"Next song", "次の曲"},
+			{"Previous song", "前の曲"},
+			{"Orb of the Moons", "月のオーブを使う"},
+			{"Show Jawbone", "あご骨を見る"},
+			{"Show inventory for Avatar", "アバターの持ち物"},
+			{"Show inventory for character 2", "2人目の持ち物"},
+			{"Show inventory for character 3", "3人目の持ち物"},
+			{"Show inventory for character 4", "4人目の持ち物"},
+			{"Show inventory for character 5", "5人目の持ち物"},
+			{"Show inventory for character 6", "6人目の持ち物"},
+			{"Show inventory for character 7", "7人目の持ち物"},
+			{"Show inventory for character 8", "8人目の持ち物"},
+			{"Show map", "地図を見る"},
+			{"Show spellbook", "呪文書を開く"},
+			{"Use abacus", "そろばんを使う"},
+			{"Use keyring", "鍵束を使う"},
+			{"Use lockpick", "解錠具を使う"},
+			{"Use watch", "懐中時計を見る"},
+	};
+	std::string key = en;
+	while (!key.empty() && isspace(static_cast<unsigned char>(key.back()))) {
+		key.pop_back();
+	}
+	for (const auto& row : table) {
+		if (key == row[0]) {
+			return row[1];
+		}
+	}
+	return en;
+}
+
 const struct Action {
 	const char*  s;
 	ActionFunc   func;
@@ -665,6 +718,11 @@ void KeyBinder::ParseLine(char* line, int lineNumber) {
 			skipspace(s);
 			// Always show if there is a comment.
 			show = true;
+			// 日本語の訳（exultmsg）が入っているときは、注釈も日本語にする。
+			const char* ja = get_text_msg(0x823 - msg_file_start);
+			if (ja && static_cast<unsigned char>(ja[0]) >= 0x80) {
+				s = Ja_key_comment(s);
+			}
 		}
 	} else {
 		// Action::dont_show doesn't have default display names, so do not
